@@ -29,7 +29,7 @@ Vexo band 43 → Bluetooth → Mac → Pipecat → Deepgram Nova-3
 - **Deepgram** provides transcription and speaker diarization. `Speaker 1` distinguishes a voice within its recognition session; it is not verified personal identity.
 - **Gemini Decision 1** classifies finalized transcript candidates as `none`, `todo`, `calendar`, or `action_item`. The title and quote come from the original text; there is no free-form generation or Flash-Lite fallback. Only validated decisions meeting the confidence threshold create suggestions.
 
-Calendar items are local suggestions for review. No calendar event is created, and no outside action is performed automatically. Old and manually added tasks retain their original provenance.
+Gemini Decision can apply explicit calendar requests automatically after Google event-edit authorization: create a clearly dated obligation, or change/cancel one unambiguous existing event. Missing dates and unclear targets remain pending with a reason shown on the task. Duplicate/replayed requests do not send repeated writes; an uncertain write result is never retried automatically. Spoken completion such as “I finished testing Bluetooth” can mark the matching existing task done. Use **Add to calendar**, **+ Event** or **Edit** for manual adjustments. Old and manually added tasks retain their original provenance.
 
 The [Decisions API](https://aistudio.google.com/docs/decisions-api) returns fixed choices and scores rather than generated prose. Motion experiments also use Gemini Decision, through a separate preview path; they do not replace the speech/action pipeline above.
 

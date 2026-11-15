@@ -121,3 +121,202 @@ class CalendarDisconnectRaceTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(CalendarAccessError):await job
             self.assertEqual(service.tokens,{})
             self.assertFalse(service.token_path.exists())
+
+class FakeCalendarResponse:
+    def __init__(self,status=200,payload=None,on_enter=None):
+        self.status=status;self.payload=payload;self.on_enter=on_enter
+    async def __aenter__(self):
+        if self.on_enter:self.on_enter()
+        return self
+    async def __aexit__(self,*args):pass
+    async def json(self):return self.payload
+
+class FakeCalendarHTTP:
+    def __init__(self,response):self.response=response;self.calls=[]
+    def request(self,*args,**kwargs):
+        self.calls.append((args,kwargs));return self.response
+
+class CalendarEditTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        from inloop_calendar import EVENTS_WRITE_SCOPE,CALENDAR_LIST_SCOPE
+        self.temp=tempfile.TemporaryDirectory();self.root=Path(self.temp.name)
+        self.agenda=CalendarAgenda(self.root);self.agenda.configure(CLIENT)
+        self.agenda.tokens=dict(refresh_token='test-refresh',access_token='test-access',expires_at=time.time()+3600,scope=' '.join((EVENTS_WRITE_SCOPE,CALENDAR_LIST_SCOPE)))
+        self.identity='personal@example.com/secondary'
+        self.calendar=dict(id=self.identity,name='Personal',timezone='America/Los_Angeles',access_role='owner',writable=True)
+        self.agenda.cache=dict(calendars=[self.calendar],events=[],date=datetime.now(zone('America/Los_Angeles')).date().isoformat())
+        self.fields=dict(title='Demo review',start='2026-11-15T10:00',end='2026-11-15T10:30',all_day=False,timezone='America/Los_Angeles',description='Bring the prototype.')
+        self.provider=dict(id='event/id?x',summary='Demo review',start={'dateTime':'2026-11-15T10:00:00-08:00','timeZone':'America/Los_Angeles'},end={'dateTime':'2026-11-15T10:30:00-08:00'},description='Bring the prototype.',etag='"version-one"')
+    def tearDown(self):self.temp.cleanup()
+
+    async def test_create_uses_exact_fields_encoded_calendar_and_no_invites(self):
+        from inloop_calendar import API_URL
+        http=FakeCalendarHTTP(FakeCalendarResponse(payload=self.provider))
+        with mock.patch.object(self.agenda,'refresh',new=mock.AsyncMock()) as refresh:
+            event=await self.agenda.create_event(http,self.identity,self.fields)
+        (method,url),options=http.calls[0]
+        self.assertEqual(method,'POST')
+        self.assertEqual(url,API_URL+'/calendars/personal%40example.com%2Fsecondary/events')
+        self.assertEqual(options['params'],{'sendUpdates':'none'})
+        self.assertEqual(options['json']['start'],{'dateTime':'2026-11-15T10:00:00-08:00','timeZone':'America/Los_Angeles'})
+        self.assertEqual(set(options['json']),{'summary','start','end','description'})
+        self.assertNotIn('attendees',options['json'])
+        self.assertEqual(event['description'],'Bring the prototype.')
+        self.assertEqual(event['timezone'],'America/Los_Angeles')
+        self.assertEqual(event['etag'],'"version-one"')
+        self.assertTrue(event['writable'])
+        refresh.assert_awaited_once_with(http)
+
+    async def test_patch_and_delete_encode_event_and_use_etag_without_overwriting_attendees(self):
+        event=normalize_event(self.provider,self.calendar);self.agenda.cache['events']=[event]
+        http=FakeCalendarHTTP(FakeCalendarResponse(payload=self.provider))
+        fields={key:value for key,value in self.fields.items() if key!='description'}
+        with mock.patch.object(self.agenda,'refresh',new=mock.AsyncMock()):
+            await self.agenda.update_event(http,self.identity,event['id'],fields)
+        (method,url),options=http.calls[0]
+        self.assertEqual(method,'PATCH');self.assertTrue(url.endswith('/events/event%2Fid%3Fx'))
+        self.assertEqual(options['headers']['If-Match'],'"version-one"')
+        self.assertNotIn('attendees',options['json']);self.assertNotIn('description',options['json'])
+        http=FakeCalendarHTTP(FakeCalendarResponse(status=204))
+        with mock.patch.object(self.agenda,'refresh',new=mock.AsyncMock()):
+            result=await self.agenda.delete_event(http,self.identity,event['id'])
+        self.assertTrue(result['deleted']);self.assertEqual(self.agenda.cache['events'],[])
+        self.assertEqual(http.calls[0][0][0],'DELETE');self.assertNotIn('json',http.calls[0][1])
+        self.assertEqual(http.calls[0][1]['params'],{'sendUpdates':'none'})
+
+    async def test_missing_event_id_cannot_target_the_event_collection(self):
+        http=FakeCalendarHTTP(FakeCalendarResponse(payload=self.provider))
+        for identity in (None,'',True):
+            with self.subTest(identity=identity):
+                with self.assertRaises(ValueError):await self.agenda.update_event(http,self.identity,identity,self.fields)
+                with self.assertRaises(ValueError):await self.agenda.delete_event(http,self.identity,identity)
+        self.assertEqual(http.calls,[])
+
+    async def test_switching_to_all_day_clears_prior_datetime_fields_in_patch(self):
+        provider={**self.provider,'start':{'date':'2026-11-15'},'end':{'date':'2026-11-16'}}
+        http=FakeCalendarHTTP(FakeCalendarResponse(payload=provider))
+        fields={**self.fields,'all_day':True,'start':'2026-11-15','end':'2026-11-16'}
+        with mock.patch.object(self.agenda,'refresh',new=mock.AsyncMock()):
+            await self.agenda.update_event(http,self.identity,'event',fields)
+        for key in ('start','end'):
+            self.assertIsNone(http.calls[0][1]['json'][key]['dateTime'])
+            self.assertIsNone(http.calls[0][1]['json'][key]['timeZone'])
+
+    async def test_readonly_token_preserves_agenda_but_cannot_send_write(self):
+        from inloop_calendar import EVENTS_READ_SCOPE,CALENDAR_LIST_SCOPE,CalendarAccessError
+        self.agenda.tokens['scope']=' '.join((EVENTS_READ_SCOPE,CALENDAR_LIST_SCOPE))
+        self.agenda.cache['events']=[normalize_event(self.provider,self.calendar)]
+        value=self.agenda.snapshot()
+        self.assertTrue(value['authorized']);self.assertTrue(value['write_authorization_required'])
+        self.assertFalse(value['writable']);self.assertFalse(value['events'][0]['writable'])
+        http=FakeCalendarHTTP(FakeCalendarResponse(payload=self.provider))
+        with self.assertRaises(CalendarAccessError):await self.agenda.create_event(http,self.identity,self.fields)
+        with self.assertRaises(CalendarAccessError):await self.agenda.delete_event(http,self.identity,'event')
+        self.assertEqual(http.calls,[])
+
+    async def test_reader_role_or_unknown_calendar_cannot_send_write(self):
+        from inloop_calendar import CalendarAccessError
+        self.calendar['access_role']='reader'
+        http=FakeCalendarHTTP(FakeCalendarResponse(payload=self.provider))
+        for identity in (self.identity,'unknown'):
+            with self.assertRaises(CalendarAccessError):await self.agenda.create_event(http,identity,self.fields)
+        self.assertEqual(http.calls,[])
+
+    async def test_write_permissions_rechecked_after_token_refresh(self):
+        from inloop_calendar import CalendarAccessError,EVENTS_READ_SCOPE
+        async def refresh_token(http):
+            self.agenda.tokens['scope']=EVENTS_READ_SCOPE
+            return 'refreshed-token'
+        http=FakeCalendarHTTP(FakeCalendarResponse(payload=self.provider))
+        with mock.patch.object(self.agenda,'_access_token',side_effect=refresh_token):
+            with self.assertRaises(CalendarAccessError):await self.agenda.create_event(http,self.identity,self.fields)
+        self.assertEqual(http.calls,[])
+
+    async def test_provider_errors_are_safe_and_never_silently_retried(self):
+        from inloop_calendar import CalendarAccessError
+        for status,error in [(401,CalendarAccessError),(403,CalendarAccessError),(412,ValueError),(404,ValueError),(429,OSError),(500,OSError)]:
+            self.agenda.tokens['expires_at']=time.time()+3600
+            http=FakeCalendarHTTP(FakeCalendarResponse(status=status,payload={'private_token':'must not appear'}))
+            with self.subTest(status=status),self.assertRaises(error) as caught:
+                await self.agenda.update_event(http,self.identity,'event',self.fields)
+            self.assertNotIn('private_token',str(caught.exception))
+            self.assertEqual(len(http.calls),1)
+            if status==401:self.assertEqual(self.agenda.tokens['expires_at'],0)
+
+    async def test_disconnect_during_write_does_not_restore_private_cache(self):
+        from inloop_calendar import CalendarAccessError
+        http=FakeCalendarHTTP(FakeCalendarResponse(payload=self.provider,on_enter=self.agenda.disconnect))
+        with self.assertRaises(CalendarAccessError):await self.agenda.create_event(http,self.identity,self.fields)
+        self.assertEqual(self.agenda.tokens,{})
+        self.assertEqual(self.agenda.cache,{})
+        self.assertFalse(self.agenda.cache_path.exists())
+
+    async def test_refresh_exposes_actual_access_role_and_write_permission(self):
+        async def get(http,token,path,params):
+            if path.endswith('calendarList'):return {'items':[dict(id=self.identity,summary='Personal',primary=True,accessRole='owner')]}
+            return {'items':[self.provider]}
+        with mock.patch.object(self.agenda,'_get',side_effect=get):
+            result=await self.agenda.refresh(None)
+        self.assertTrue(result['writable'])
+        self.assertEqual(result['calendars'][0]['access_role'],'owner')
+        self.assertTrue(result['calendars'][0]['writable'])
+        self.assertFalse(result['write_authorization_required'])
+
+class CalendarFormValidationTests(unittest.TestCase):
+    def form(self,**changes):
+        return dict(title='Review',start='2026-11-15T10:00',end='2026-11-15T11:00',all_day=False,timezone='America/Los_Angeles',**changes)
+
+    def test_all_day_dates_are_exclusive_and_never_convert_to_utc_midnight(self):
+        from inloop_calendar import event_fields
+        form=self.form();form.update(all_day=True,start='2026-03-08',end='2026-03-09')
+        result=event_fields(form)
+        self.assertEqual(result['start'],{'date':'2026-03-08'})
+        self.assertEqual(result['end'],{'date':'2026-03-09'})
+        form['end']='2026-03-08'
+        with self.assertRaises(ValueError):event_fields(form)
+
+    def test_rejects_unknown_fields_invalid_times_and_bad_form_values(self):
+        from inloop_calendar import event_fields
+        changes=[{'attendees':[{'email':'person@example.com'}]},{'recurrence':['RRULE:FREQ=DAILY']},{'title':''},{'title':True},{'all_day':'false'},{'timezone':'not/a/timezone'},{'start':123},{'start':'bad'},{'end':'2026-11-15T09:00'},{'description':{}},{'description':'x'*10001}]
+        for change in changes:
+            with self.subTest(change=list(change)),self.assertRaises(ValueError):event_fields({**self.form(),**change})
+
+    def test_clock_change_gaps_and_ambiguous_local_times_require_explicit_choices(self):
+        from inloop_calendar import event_fields
+        for start,end in [('2026-03-08T02:30','2026-03-08T04:00'),('2026-11-01T01:30','2026-11-01T03:00')]:
+            with self.subTest(start=start),self.assertRaises(ValueError):event_fields({**self.form(),'start':start,'end':end})
+        result=event_fields({**self.form(),'start':'2026-11-01T01:30:00-07:00','end':'2026-11-01T01:30:00-08:00'})
+        self.assertEqual(result['start']['dateTime'],'2026-11-01T01:30:00-07:00')
+
+class CalendarDateNavigationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_selected_day_persists_drives_query_and_hides_other_day_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service=CalendarAgenda(directory);service.configure(CLIENT)
+            service.tokens=dict(refresh_token='test-refresh',access_token='test-access',expires_at=time.time()+3600,scope=' '.join(SCOPES))
+            actual_today=service.snapshot()['today']
+            service.cache=dict(date=actual_today,events=[{'id':'old','calendar_id':'primary'}])
+            service.select_date('2026-11-18')
+            self.assertEqual(service.snapshot()['date'],'2026-11-18')
+            self.assertEqual(service.snapshot()['today'],actual_today)
+            if actual_today!='2026-11-18':self.assertEqual(service.snapshot()['events'],[])
+            queried=[]
+            async def get(http,token,path,params):
+                if path.endswith('calendarList'):return {'items':[dict(id='primary',summary='Main',primary=True,accessRole='owner',timeZone='America/Los_Angeles')]}
+                queried.append(params)
+                return {'items':[dict(id='deadline',summary='Paper deadline',start={'dateTime':'2026-11-18T16:00:00-08:00'},end={'dateTime':'2026-11-18T17:00:00-08:00'})]}
+            with mock.patch.object(service,'_get',side_effect=get):await service.refresh(None)
+            self.assertTrue(queried[0]['timeMin'].startswith('2026-11-18T00:00:00'))
+            self.assertTrue(queried[0]['timeMax'].startswith('2026-11-19T00:00:00'))
+            value=service.snapshot()
+            self.assertEqual(value['events'][0]['title'],'Paper deadline')
+            self.assertTrue(value['events'][0]['writable'])
+            self.assertTrue(value['open_url'].endswith('/2026/11/18'))
+            reopened=CalendarAgenda(directory)
+            self.assertEqual(reopened.snapshot()['date'],'2026-11-18')
+
+    async def test_bad_selected_dates_are_rejected_without_saving(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service=CalendarAgenda(directory)
+            for value in [None,True,'2026-02-30','2026-1-1','2026-11-18T10:00','not-a-date']:
+                with self.subTest(value=value),self.assertRaises(ValueError):service.select_date(value)
+            self.assertFalse(service.preferences_path.exists())

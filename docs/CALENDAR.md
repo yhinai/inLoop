@@ -6,11 +6,22 @@ Today replaces the large Devices panel. Device connection indicators and **Devic
 
 - **Calendars ↗** opens calendar selection and connection settings.
 - Select up to five calendars; the primary calendar is selected initially.
-- Click an event to open it in Google Calendar.
+- Click an event to open it in Google Calendar; use **Edit** to change its title, dates, time zone or notes, or delete that event.
+- **+ Event** opens a new event form.
+- **Add to calendar** on a task opens the same form with its spoken title. Supported date/time phrases are prefilled relative to the source speech; missing or ambiguous dates need your input. Check the details before saving.
 - **Open calendar ↗** opens the displayed day.
 - Empty days, missing access, and stale cached data have distinct labels.
 
-Calendar access is **read-only**. inLoop does not create events, send invitations, or change existing events. Task suggestions and existing speech processing remain separate.
+Gemini Decision can apply clear spoken calendar requests automatically after Google event-edit authorization. The event editor remains available for manual changes. Deleting an event asks for confirmation. Only calendars where your account is an owner or writer can be edited. A new spoken obligation needs a concrete date. If no time is spoken, it becomes an all-day event; a timed event uses the spoken time. An edit or cancellation needs one exact existing event. Ambiguous requests remain pending with a reason on the task. Replayed requests and uncertain network outcomes never trigger automatic repeated writes. The editor does not add attendees.
+
+## Speech actions
+
+- “Schedule dentist tomorrow at 2 PM” creates a timed event; “I need to pick up grandma from the airport on Saturday” creates an all-day event. Without an explicit duration, a timed event uses 30 minutes.
+- “Move dentist to Wednesday at 3 PM” updates one exact matching future event.
+- “Cancel dentist tomorrow at 2 PM” removes one exact matching event.
+- “I finished testing the Bluetooth connection” completes the matching open to-do.
+
+Dates are interpreted relative to the source speech time in America/Los_Angeles. Unsupported or ambiguous phrases such as “next week” need more detail. Calendar operations use Gemini Decision 1 closed choices; event IDs come from the actual calendar, never model-generated IDs. The durable local action ledger records the result. Pending authorization requests resume after you grant event-edit access.
 
 ## Google sign-in
 
@@ -22,9 +33,11 @@ For another installation:
 2. Configure the OAuth consent screen. For a personal testing project, add your Google account as a test user.
 3. Create a Desktop app OAuth client and download its JSON file.
 4. In Today, choose **Connect ↗**, select the JSON file, and **Continue with Google**.
-5. Allow these read-only permissions:
-   - `calendar.events.readonly`
+5. Allow these permissions:
+   - `calendar.events` (read, create, edit and delete events)
    - `calendar.calendarlist.readonly`
+
+If you previously connected with read-only access, open **Calendars ↗ → Allow calendar changes** and reconnect once. The existing agenda remains available until then.
 
 The Google consent screen displays the project's branding, which may differ from the Desktop client's name. Creating a separate Desktop client does not rename other apps in that project.
 

@@ -19,6 +19,7 @@ from aiohttp import web
 
 from config import ROOT, load_env
 from inloop_calendar import CalendarAgenda, CalendarAccessError
+from inloop_calendar_decisions import CalendarAutomation
 
 STATIC = ROOT/'web'
 TELEMETRY_URL = 'https://alhinai.dev/api/telemetry'
@@ -28,8 +29,8 @@ DECISION_ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta/decisions'
 DECISION_THRESHOLD = 0.80
 TASK_CRITERIA = {
     'none': 'Default: not a concrete outstanding obligation. Reject vague commands (do this, add item, mention it), general advice, pure feature/UI discussion, purely hypothetical examples, quoted requests, questions for information, completed/negated actions, and duplicates. Mentioning a task, appointment or deadline is not enough without a real future obligation. The candidate itself must name the specific work or event; do not invent its missing object from context.',
-    'todo': 'A real, specific outstanding personal action or request with a named object and a recognizable completion condition. Example: Send the revised paper to Maya. Exclude generic commands, examples and discussion of how task extraction should work. A time is optional.',
-    'calendar': 'A real future obligation to attend, prepare for or schedule a specific appointment/event, or meet a concrete dated deadline. Examples: I need to get to my dentist appointment tomorrow; Our paper submission is due Friday. Merely talking about appointments or hypothetical deadlines is none. Store only a reviewable suggestion, never book anything.',
+    'todo': 'A real specific outstanding personal action, commitment or request with a recognizable completion condition. Dated tasks WITHOUT a specific time or time range belong here: I need to pick up grandmother on Sunday. A date alone must not create a calendar event. Exclude vague commands, hypothetical examples, completed work and feature discussion.',
+    'calendar': 'A real specific commitment with a concrete date AND time or time range that should block the calendar as well as appear in To-do. Example: I will be out from 3 to 6 to pick up grandmother on Sunday. Also explicit requests to add an all-day event, reschedule or cancel an existing event belong here. A date-only obligation such as pick up grandma on Sunday is todo, not calendar.',
     'action_item': 'A real specific outstanding team commitment or assigned follow-up with named work and a recognizable completion condition. Example: Alex will send the integration test report to the team. Generic coordination advice and discussion of action-item features are none.',
 }
 
@@ -45,10 +46,20 @@ def vague_task(text):
         r"(?:mention|fix|change|make|handle) (?:this|that|it)|(?:to do|todo)(?: list)?)",words))
 
 
-def task_speaker(item):
+def task_speaker(item, quote=None, *, last=False):
     turns=item.get('event',{}).get('speaker_turns',[])
-    keys={turn.get('speaker_key') for turn in turns}
-    return next(iter(keys)) if len(keys)==1 and None not in keys else None
+    if not turns:return None
+    turn=turns[-1] if last else turns[0]
+    # An event can contain several speakers; only join text wholly within its boundary turn.
+    if quote is not None and quote not in turn.get('text',item['text'] if len(turns)==1 else ''):
+        # Diarization can label a trailing date as a different uncertain speaker.
+        # Retain the action speaker only when every extra turn is just a date/time.
+        date_tail=r"(?:on |at |by )?(?:(?:this |next )?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)|today|tomorrow|\d{1,2}(?::\d{2})?\s*[ap]m)(?: at \d{1,2}(?::\d{2})?\s*[ap]m)?[.!?]?"
+        joined=' '.join(t.get('text','').strip() for t in turns)
+        if (last or len(turns)<2 or ' '.join(quote.split())!=' '.join(joined.split())
+                or not all(t.get('voice_identity',{}).get('status')=='uncertain'
+                           and re.fullmatch(date_tail,t.get('text','').strip(),re.I) for t in turns[1:])):return None
+    return turn.get('speaker_key')
 
 
 def task_candidates(items, existing):
@@ -63,7 +74,8 @@ def task_candidates(items, existing):
             previous=chunks[-1] if chunks else None
             if (index==0 and previous and previous['last']['id']!=item['id']
                     and not re.search(r'[.!?][\"\']?$',previous['text'])
-                    and task_speaker(item) is not None and task_speaker(previous['last'])==task_speaker(item)
+                    and task_speaker(item,quote) is not None
+                    and task_speaker(previous['last'],previous['spans'][-1]['quote'],last=True)==task_speaker(item,quote)
                     and item.get('session_id')==previous['last'].get('session_id')
                     and 0<=item.get('said_at',0)-previous['last'].get('said_at',0)<=15
                     and len(previous['spans'])<3 and len(previous['text'])+len(quote)<240):
@@ -82,12 +94,13 @@ def task_candidates(items, existing):
     return candidates
 
 
-def task_answer(answer):
+def task_answer(answer, criteria=None):
+    criteria=TASK_CRITERIA if criteria is None else criteria
     if not isinstance(answer,dict) or answer.get('type')!='choice':raise ValueError('Invalid decision answer')
     choice=answer.get('choice');confidence=answer.get('confidence');scores=answer.get('probabilities')
     valid=lambda value:isinstance(value,(int,float)) and not isinstance(value,bool) and math.isfinite(value) and 0<=value<=1
-    if (choice not in TASK_CRITERIA or not valid(confidence) or not isinstance(scores,dict)
-            or set(scores)!=set(TASK_CRITERIA) or not all(valid(v) for v in scores.values())
+    if (choice not in criteria or not valid(confidence) or not isinstance(scores,dict)
+            or set(scores)!=set(criteria) or not all(valid(v) for v in scores.values())
             or abs(sum(scores.values())-1)>.01 or scores[choice]<max(scores.values())-1e-6
             or abs(confidence-scores[choice])>.02):raise ValueError('Invalid decision probabilities')
     return choice,float(confidence)
@@ -115,6 +128,7 @@ class Workspace:
             CREATE INDEX IF NOT EXISTS events_time ON events(session_id,said_at);
             CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY,session_id TEXT,title TEXT,status TEXT,
                 priority TEXT,owner TEXT,source_id TEXT,quote TEXT,created_at REAL,deleted INTEGER DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS task_actions(task_id TEXT, source_id TEXT, operation TEXT, quote TEXT, confidence REAL, created_at REAL, PRIMARY KEY(task_id,source_id,operation));
             CREATE TABLE IF NOT EXISTS task_sources(task_id TEXT, ordinal INTEGER, source_id TEXT, quote TEXT, PRIMARY KEY(task_id,ordinal));
             CREATE TABLE IF NOT EXISTS fixes(id TEXT PRIMARY KEY,recorded_at REAL,observed_at REAL,payload TEXT);
             CREATE INDEX IF NOT EXISTS fixes_time ON fixes(recorded_at);
@@ -227,6 +241,7 @@ class InLoop:
     def __init__(self, db_path, bridge='http://127.0.0.1:8787', health='http://127.0.0.1:8788/health', gemini_env=None):
         self.store=Workspace(db_path);self.bridge=bridge;self.health_url=health;self.gemini_env=gemini_env
         env=load_env();self.calendar=CalendarAgenda(Path(db_path).parent, env.get('INLOOP_GOOGLE_OAUTH_CLIENT_FILE') or None);self.calendar_changed=asyncio.Event();self.caption_token=env.get('OMI_CAPTION_TOKEN',env.get('OMI_STREAM_TOKEN',''))
+        self.calendar_automation=CalendarAutomation(self.store.db,self.gemini_env)
         self.nonce=secrets.token_urlsafe(24);self.clients=set();self.health={};self.telemetry={};self.devices={}
         self.github={'items':[],'status':'connecting','checked_at':None}
         self.phone={'connected':False,'name':'Phone','source':'adb'};self.network={}
@@ -240,8 +255,10 @@ class InLoop:
 
     def snapshot(self, session=None):
         session=session or self.store.current
+        calendar_actions=self.calendar_automation.statuses()
+        tasks=[{**task,'calendar_action':calendar_actions.get(task['id'])} for task in self.store.tasks(session)]
         return dict(current_session=self.store.current,session_id=session,sessions=self.store.sessions(),
-            events=self.store.events(session),tasks=self.store.tasks(session),partial=self.partial if session==self.store.current else None,
+            events=self.store.events(session),tasks=tasks,partial=self.partial if session==self.store.current else None,
             health=self.health,telemetry=self.telemetry,devices=self.devices,github=self.github,phone=self.phone,network=self.network,calendar=self.calendar.snapshot(),status=self.status,csrf=self.nonce)
 
     async def refresh(self):await self.broadcast(dict(type='state',data=self.snapshot()))
@@ -397,8 +414,22 @@ class InLoop:
                 "An explicit first-person commitment still counts when made while testing the app: Yes, I need to submit a paper this Wednesday at 5PM is real. "
                 "Joined source_spans are consecutive parts of one utterance, not an invented object. Reject purely hypothetical examples. "
                 "An actual appointment to attend tomorrow or a specific paper submission deadline qualifies even without an imperative verb. "
-                "Choose calendar for specific dated events/deadlines, todo for personal work, action_item for assigned team follow-up. "
+                "Choose todo for dated obligations WITHOUT a specific time. Choose calendar only for a dated commitment WITH a time or time range, an explicit all-day calendar request, or an explicit request to reschedule/cancel an existing event. Choose action_item for assigned team follow-up. "
                 "Existing tasks must not be duplicated. When uncertain choose none.")
+        # Completion is a separate closed-choice decision against actual open task IDs.
+        completion_tasks=[task for task in existing if task['status']!='done'][:100]
+        completion_criteria={'none':'No existing task has clearly been fulfilled in context; being on the way, planning, discussing, negating or merely starting work is not completion.'}
+        completion_criteria.update({f'task_{index}':task['title'] for index,task in enumerate(completion_tasks)})
+        completion_questions={}
+        if completion_tasks:
+            for index,candidate in enumerate(candidates):
+                name=f'completion_{index}';completion_questions[name]=candidate
+                questions[name]=dict(type='choice',criteria=completion_criteria,
+                    instructions=f"Use candidates[{index}] as the new evidence and shared context to understand what happened. Select the existing task whose concrete goal has now been achieved, even without words finished/done/complete. "
+                    "For an airport pickup, Grandma is with me now and we are leaving the airport establishes success; I am heading to the airport or waiting for her does not. "
+                    "Use natural synonyms (grandmother/grandma), task details and temporal context; conflicting dates or people mean none unless the new speech clearly corrects them. "
+                    "The candidate must add evidence of actual fulfillment, not just repeat an old completed statement from context. Reject hypotheticals, questions, negations, future promises, feature discussion and progress without an achieved goal. "
+                    "Choose none if several tasks fit equally. Never invent completion or select an unrelated task.")
         payload=dict(model=DECISION_MODEL,input=json.dumps(dict(
             candidates=candidates,context=[dict(source_id=item['id'],text=item['text'][:3200]) for item in items[-12:]],
             existing_tasks=[task['title'] for task in existing[:100]])),questions=questions)
@@ -409,15 +440,53 @@ class InLoop:
         answers=result.get('answers') if isinstance(result,dict) else None
         if not isinstance(answers,dict) or set(answers)!=set(questions):raise ValueError('Incomplete decision response')
         # Validate the whole batch before persisting anything, so malformed output fails closed.
-        decisions=[(*task_answer(answers[name]),1-answers[name]['probabilities']['none']) for name in questions]
+        decisions=[(*task_answer(answers[f'candidate_{index}']),1-answers[f'candidate_{index}']['probabilities']['none']) for index in range(len(candidates))]
+        completions=[(candidate,*task_answer(answers[name],completion_criteria)) for name,candidate in completion_questions.items()]
         created=[]
         for candidate,(kind,confidence,action_probability) in zip(candidates,decisions):
             # Uncertainty between todo and calendar must not discard a clear obligation.
             if kind=='none' or action_probability<DECISION_THRESHOLD:continue
+            if kind=='calendar':
+                from inloop_calendar_decisions import TIME_PATTERN
+                has_time=bool(TIME_PATTERN.search(candidate['text']) or re.search(r'\b(?:at|from|until)\s+(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|\d{1,2})\b',candidate['text'],re.I))
+                explicit_change=bool(re.search(r'\b(?:cancel|delete|remove|reschedule|move|shift|all[ -]day)\b',candidate['text'],re.I))
+                if not has_time and not explicit_change:kind='todo'
             task=self.store.add_task(candidate['text'],session=session,source_id=candidate['source_id'],quote=candidate.get('source_spans',[dict(quote=candidate['text'])])[0]['quote'],
                 source_spans=candidate.get('source_spans'),kind=kind,decision_model=DECISION_MODEL,decision_confidence=confidence)
             if task:created.append(task)
+        for candidate,choice,confidence in completions:
+            if choice=='none' or confidence<.90:continue
+            task=completion_tasks[int(choice.split('_')[1])]
+            if self.store.db.execute('SELECT 1 FROM task_actions WHERE task_id=? AND source_id=? AND operation=?',
+                                     (task['id'],candidate['source_id'],'complete')).fetchone():continue
+            self.store.update_task(task['id'],{'status':'done'})
+            self.store.db.execute('INSERT INTO task_actions VALUES(?,?,?,?,?,?)',
+                                  (task['id'],candidate['source_id'],'complete',candidate['text'],confidence,time.time()))
+            self.store.db.commit()
         return created
+
+    async def calendar_actions(self, tasks=None):
+        if tasks is None:
+            identities=self.calendar_automation.pending_task_ids()
+            tasks=[]
+            for identity in identities:
+                row=self.store.db.execute('SELECT * FROM tasks WHERE id=? AND deleted=0 AND status!=?',(identity,'done')).fetchone()
+                if row:tasks.append(dict(row))
+        for task in tasks:
+            if task.get('kind')!='calendar' or not task.get('source_id'):continue
+            source=self.store.event(task['source_id'])
+            if not source:continue
+            spans=[dict(row) for row in self.store.db.execute('SELECT source_id,quote FROM task_sources WHERE task_id=? ORDER BY ordinal',(task['id'],))]
+            if spans:
+                # Reconstruct only persisted, verified transcript quotes, never generated text.
+                if any(not (event:=self.store.event(span['source_id'])) or event['session_id']!=task['session_id']
+                       or span['quote'] not in event['text'] for span in spans):continue
+                source={**source,'text':' '.join(span['quote'] for span in spans)}
+            context=self.store.db.execute('SELECT text FROM events WHERE session_id=? AND said_at>=? AND said_at<=? ORDER BY said_at,rowid',
+                                          (task['session_id'],source['said_at']-90,source['said_at']+15)).fetchall()
+            source={**source,'context':'\n'.join(row['text'] for row in context)[-5000:]}
+            await self.calendar_automation.process(self.http,self.calendar,task,source)
+        if tasks:await self.broadcast(dict(type='calendar',data=self.calendar.snapshot()))
 
     async def task_loop(self):
         while True:
@@ -430,7 +499,9 @@ class InLoop:
                 for identity in batch:
                     event=self.store.event(identity)
                     if event:groups.setdefault(event['session_id'],[]).append(identity)
-                for identities in groups.values():await self.extract(identities[-12:])
+                for identities in groups.values():
+                    created=await self.extract(identities[-12:])
+                    await self.calendar_actions(created or [])
                 self.status['tasks']='ready'
             except asyncio.CancelledError:raise
             except Exception:self.status['tasks']='unavailable'
@@ -439,6 +510,10 @@ class InLoop:
     async def calendar_loop(self):
         while True:
             await self.calendar.refresh(self.http)
+            calendar=self.calendar.snapshot()
+            if calendar.get('writable'):
+                await self.calendar_actions()
+                await self.refresh()
             await self.broadcast(dict(type='calendar',data=self.calendar.snapshot()))
             try:
                 await asyncio.wait_for(self.calendar_changed.wait(),60)
@@ -482,7 +557,7 @@ def application(workspace, *, workers=True):
     async def index(request):return web.FileResponse(STATIC/'index.html')
     async def asset(request):
         name=request.match_info['name']
-        if name not in ('app.js','style.css','manifest.webmanifest','icon.svg','demo.js','google-map.js','calendar.js'):raise web.HTTPNotFound()
+        if name not in ('app.js','style.css','manifest.webmanifest','icon.svg','demo.js','google-map.js','calendar.js','calendar-editor.js'):raise web.HTTPNotFound()
         return web.FileResponse(STATIC/name)
     async def vendor(request):
         name=request.match_info['name']
@@ -513,6 +588,10 @@ def application(workspace, *, workers=True):
     async def calendar_refresh(request):
         workspace.calendar_changed.set()
         return web.json_response({'queued':True})
+    async def calendar_date(request):
+        workspace.calendar.select_date((await request.json()).get('date'))
+        workspace.calendar_changed.set()
+        return web.json_response({'queued':True})
     async def calendar_select(request):
         workspace.calendar.select((await request.json()).get('selected'))
         workspace.calendar_changed.set()
@@ -521,6 +600,27 @@ def application(workspace, *, workers=True):
         workspace.calendar.disconnect()
         await workspace.broadcast(dict(type='calendar',data=workspace.calendar.snapshot()))
         return web.json_response({'disconnected':True})
+    async def calendar_event_write(request):
+        data=await request.json()
+        if not isinstance(data,dict):raise ValueError('Choose an event and calendar.')
+        calendar_id=data.get('calendar_id')
+        if not isinstance(calendar_id,str) or not calendar_id:raise ValueError('Choose a calendar.')
+        event_id=request.match_info.get('event_id')
+        try:
+            if request.method=='DELETE':
+                await workspace.calendar.delete_event(workspace.http,calendar_id,event_id)
+                event=None
+            else:
+                fields=data.get('event')
+                if not isinstance(fields,dict):raise ValueError('Enter the event details.')
+                if request.method=='POST':event=await workspace.calendar.create_event(workspace.http,calendar_id,fields)
+                else:event=await workspace.calendar.update_event(workspace.http,calendar_id,event_id,fields)
+        except CalendarAccessError as error:
+            return web.json_response({'error':str(error)},status=403)
+        except (aiohttp.ClientError,OSError,TimeoutError):
+            return web.json_response({'error':'Google Calendar could not complete this change. Refresh your calendar before trying again.'},status=502)
+        await workspace.broadcast(dict(type='calendar',data=workspace.calendar.snapshot()))
+        return web.json_response(dict(event=event,calendar=workspace.calendar.snapshot()))
     async def maps_config(request):
         # This is explicitly a browser Maps key, never a Gemini/server credential.
         key=load_env().get('GOOGLE_MAPS_BROWSER_KEY','').strip()
@@ -565,8 +665,12 @@ def application(workspace, *, workers=True):
         lines+=['## Action items','']+[f"- [{'x' if t['status']=='done' else ' '}] {t['title']}" for t in workspace.store.tasks(session)]
         return web.Response(text='\n'.join(lines),content_type='text/markdown',headers={'Content-Disposition':'attachment; filename="inLoop-session.md"'})
     app.router.add_get('/',index);app.router.add_get('/preview',index);app.router.add_get('/assets/{name}',asset);app.router.add_get('/assets/vendor/{name}',vendor)
+    app.router.add_post('/api/calendar/events',calendar_event_write)
+    app.router.add_patch('/api/calendar/events/{event_id}',calendar_event_write)
+    app.router.add_delete('/api/calendar/events/{event_id}',calendar_event_write)
     app.router.add_post('/api/calendar/setup',calendar_setup);app.router.add_post('/api/calendar/connect',calendar_connect)
     app.router.add_get('/api/calendar/callback',calendar_callback);app.router.add_post('/api/calendar/refresh',calendar_refresh)
+    app.router.add_post('/api/calendar/date',calendar_date)
     app.router.add_post('/api/calendar/select',calendar_select);app.router.add_post('/api/calendar/disconnect',calendar_disconnect)
     app.router.add_get('/api/maps-config',maps_config);app.router.add_get('/api/state',snapshot);app.router.add_get('/api/live',stream)
     app.router.add_post('/api/tasks',task_create);app.router.add_patch('/api/tasks/{id}',task_update)

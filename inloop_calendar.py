@@ -1,4 +1,4 @@
-"""Read-only Google Calendar agenda with local OAuth, PKCE and private storage."""
+"""Google Calendar agenda and explicit event edits with private local OAuth."""
 import asyncio
 import base64
 from datetime import date, datetime, time as day_time, timedelta
@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from pathlib import Path
 import secrets
 import time
@@ -17,8 +18,11 @@ import aiohttp
 AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth'
 TOKEN_URL = 'https://oauth2.googleapis.com/token'
 API_URL = 'https://www.googleapis.com/calendar/v3'
-SCOPES = ('https://www.googleapis.com/auth/calendar.events.readonly',
-          'https://www.googleapis.com/auth/calendar.calendarlist.readonly')
+EVENTS_READ_SCOPE = 'https://www.googleapis.com/auth/calendar.events.readonly'
+EVENTS_WRITE_SCOPE = 'https://www.googleapis.com/auth/calendar.events'
+CALENDAR_LIST_SCOPE = 'https://www.googleapis.com/auth/calendar.calendarlist.readonly'
+FULL_CALENDAR_SCOPE = 'https://www.googleapis.com/auth/calendar'
+SCOPES = (EVENTS_WRITE_SCOPE, CALENDAR_LIST_SCOPE)
 
 
 class CalendarAccessError(Exception):
@@ -53,6 +57,53 @@ def zone(value):
         return ZoneInfo('America/Los_Angeles')
 
 
+def event_fields(fields):
+    """Validate the small edit form; never accept guests, invitations or arbitrary API fields."""
+    allowed={'title','start','end','all_day','timezone','description'}
+    if not isinstance(fields,dict) or set(fields)-allowed:
+        raise ValueError('Use only title, start, end, all_day, timezone and description.')
+    if not {'title','start','end','all_day','timezone'}.issubset(fields):
+        raise ValueError('Enter a title, start, end, timezone and all-day setting.')
+    title=fields['title']
+    if not isinstance(title,str) or not title.strip() or len(title)>300:
+        raise ValueError('Enter an event title of at most 300 characters.')
+    if not isinstance(fields['all_day'],bool):raise ValueError('Invalid all-day setting.')
+    tz_name=fields['timezone']
+    if not isinstance(tz_name,str):raise ValueError('Choose a valid timezone.')
+    try:tz=ZoneInfo(tz_name)
+    except (ValueError,ZoneInfoNotFoundError):raise ValueError('Choose a valid timezone.') from None
+    description=fields.get('description')
+    if 'description' in fields and (not isinstance(description,str) or len(description)>10000):
+        raise ValueError('Description must be text of at most 10000 characters.')
+    dates=[]
+    for key in ('start','end'):
+        value=fields[key]
+        if not isinstance(value,str) or len(value)>100:raise ValueError('Enter valid event dates.')
+        try:
+            if fields['all_day']:
+                if not re.fullmatch(r'\d{4}-\d{2}-\d{2}',value):raise ValueError()
+                parsed=date.fromisoformat(value)
+                dates.append((parsed,{'date':parsed.isoformat()}))
+            else:
+                if 'T' not in value:raise ValueError()
+                parsed=datetime.fromisoformat(value.replace('Z','+00:00'))
+                if parsed.tzinfo is None:
+                    local=parsed;parsed=local.replace(tzinfo=tz)
+                    if datetime.fromtimestamp(parsed.timestamp(),tz).replace(tzinfo=None)!=local:
+                        raise ValueError('This local time does not exist because the clock changes. Choose another time.')
+                    other=local.replace(tzinfo=tz,fold=1)
+                    if other.utcoffset()!=parsed.utcoffset():
+                        raise ValueError('This local time occurs twice. Include its UTC offset to choose an occurrence.')
+                dates.append((parsed.timestamp(),{'dateTime':parsed.isoformat(),'timeZone':tz_name}))
+        except (ValueError,OverflowError) as error:
+            if str(error).startswith('This local time'):raise
+            raise ValueError('Enter valid event dates and times.') from None
+    if dates[1][0]<=dates[0][0]:raise ValueError('The event end must be after its start. All-day end dates are exclusive.')
+    result=dict(summary=title.strip(),start=dates[0][1],end=dates[1][1])
+    if description is not None:result['description']=description
+    return result
+
+
 def normalize_event(event, calendar):
     if not isinstance(event, dict) or event.get('status') == 'cancelled':
         return None
@@ -80,7 +131,14 @@ def normalize_event(event, calendar):
         link = 'https://calendar.google.com/'
     return dict(id=str(event.get('id', ''))[:500], calendar_id=calendar['id'],
                 calendar_name=calendar['name'], title=str(event.get('summary') or 'Untitled event')[:300],
-                start=begin, end=finish, all_day=all_day, html_url=link)
+                start=begin, end=finish, all_day=all_day, html_url=link,
+                start_iso=start.get('date') if all_day else start.get('dateTime'),
+                end_iso=end.get('date') if all_day else end.get('dateTime'),
+                description=str(event.get('description') or '')[:10000],
+                timezone=str(start.get('timeZone') or calendar.get('timezone') or 'America/Los_Angeles'),
+                etag=event.get('etag') if isinstance(event.get('etag'),str) else None,
+                writable=bool(calendar.get('writable')))
+
 
 
 class CalendarAgenda:
@@ -122,18 +180,44 @@ class CalendarAgenda:
         self.client = client
         self.status = 'connecting' if self.tokens else 'disconnected'
 
+    def has_write_scope(self):
+        scopes=self.tokens.get('scope','')
+        granted=set(scopes.split()) if isinstance(scopes,str) else set()
+        return bool(granted & {EVENTS_WRITE_SCOPE,FULL_CALENDAR_SCOPE})
+
+    def selected_date(self, tz_name=None):
+        value=self.preferences.get('date')
+        if isinstance(value,str) and re.fullmatch(r'\d{4}-\d{2}-\d{2}',value):
+            try:return date.fromisoformat(value)
+            except ValueError:pass
+        return datetime.now(zone(tz_name or self.cache.get('timezone'))).date()
+
+    def select_date(self, value):
+        if not isinstance(value,str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}',value):
+            raise ValueError('Choose a calendar date in YYYY-MM-DD format.')
+        try:day=date.fromisoformat(value)
+        except ValueError:raise ValueError('Choose a valid calendar date.') from None
+        self.preferences['date']=day.isoformat()
+        private_json(self.preferences_path,self.preferences)
+
     def snapshot(self):
         tz_name = self.cache.get('timezone', 'America/Los_Angeles')
         today = datetime.now(zone(tz_name)).date().isoformat()
-        valid_day = self.cache.get('date') == today
+        selected_day = self.selected_date(tz_name).isoformat()
+        valid_day = self.cache.get('date') == selected_day
         selected = self.preferences.get('selected')
-        events = [e for e in self.cache.get('events', []) if selected is None or e.get('calendar_id') in selected]
+        calendars=[{**c,'writable':self.has_write_scope() and c.get('access_role') in ('owner','writer')}
+                   for c in self.cache.get('calendars',[])]
+        writable={c['id'] for c in calendars if c['writable']}
+        events = [{**e,'writable':e.get('calendar_id') in writable} for e in self.cache.get('events', [])
+                  if selected is None or e.get('calendar_id') in selected]
         return dict(status=self.status, configured=bool(self.client), authorized=bool(self.tokens),
                     events=events if valid_day else [],
-                    calendars=self.cache.get('calendars', []),
-                    selected=self.preferences.get('selected', []), timezone=tz_name, date=today,
+                    calendars=calendars, writable=bool(writable),
+                    write_authorization_required=bool(self.tokens) and not self.has_write_scope(),
+                    selected=self.preferences.get('selected', []), timezone=tz_name, date=selected_day, today=today,
                     checked_at=self.cache.get('checked_at'),
-                    open_url='https://calendar.google.com/calendar/u/0/r/day/' + today.replace('-', '/'))
+                    open_url='https://calendar.google.com/calendar/u/0/r/day/' + selected_day.replace('-', '/'))
 
     def begin(self, redirect_uri):
         if not self.client:
@@ -164,8 +248,11 @@ class CalendarAgenda:
             if generation != self.generation:
                 raise ValueError('Calendar connection was cancelled.')
             granted = set(data.get('scope', '').split())
-            if granted and not set(SCOPES).issubset(granted):
-                raise ValueError('Allow read access to calendar events and the calendar list to connect.')
+            if granted and (not granted.intersection({EVENTS_READ_SCOPE,EVENTS_WRITE_SCOPE,FULL_CALENDAR_SCOPE})
+                    or not granted.intersection({CALENDAR_LIST_SCOPE,FULL_CALENDAR_SCOPE})):
+                raise ValueError('Allow calendar event access and read access to the calendar list to connect.')
+            if not granted:data['scope']=' '.join(SCOPES)
+
             if not data.get('refresh_token'):
                 raise ValueError('Google did not provide offline access. Please connect again.')
             self.tokens = data
@@ -228,7 +315,9 @@ class CalendarAgenda:
                     for c in result.get('items', []):
                         if c.get('deleted') or c.get('hidden') or not isinstance(c.get('id'), str): continue
                         calendars.append(dict(id=c['id'], name=str(c.get('summary') or 'Calendar')[:200],
-                                              timezone=str(c.get('timeZone') or 'America/Los_Angeles'), primary=bool(c.get('primary'))))
+                                              timezone=str(c.get('timeZone') or 'America/Los_Angeles'), primary=bool(c.get('primary')),
+                                              access_role=str(c.get('accessRole') or 'reader'),
+                                              writable=self.has_write_scope() and c.get('accessRole') in ('owner','writer')))
                     page = result.get('nextPageToken')
                     if not page: break
                 selected = self.preferences.get('selected')
@@ -239,9 +328,9 @@ class CalendarAgenda:
                 active = [c for c in calendars if c['id'] in selected][:5]
                 tz_name = next((c['timezone'] for c in calendars if c['primary']), 'America/Los_Angeles')
                 tz = zone(tz_name)
-                today = datetime.now(tz).date()
-                start = datetime.combine(today, day_time(), tz)
-                finish = datetime.combine(today+timedelta(days=1), day_time(), tz)
+                selected_day = self.selected_date(str(tz))
+                start = datetime.combine(selected_day, day_time(), tz)
+                finish = datetime.combine(selected_day+timedelta(days=1), day_time(), tz)
                 async def events_for(calendar):
                     events, page = [], None
                     for _ in range(5):
@@ -260,7 +349,7 @@ class CalendarAgenda:
                 events.sort(key=lambda e: (not e['all_day'], e['start'], e['calendar_id'], e['id']))
                 if generation != self.generation:
                     return self.snapshot()
-                self.cache = dict(events=events, calendars=calendars, timezone=str(tz), date=today.isoformat(), checked_at=time.time())
+                self.cache = dict(events=events, calendars=calendars, timezone=str(tz), date=selected_day.isoformat(), checked_at=time.time())
                 private_json(self.cache_path, self.cache)
                 self.status = 'connected'
             except CalendarAccessError:
@@ -268,6 +357,106 @@ class CalendarAgenda:
             except (aiohttp.ClientError, OSError, TimeoutError, ValueError, TypeError, KeyError):
                 if generation == self.generation:self.status = 'unavailable'
         return self.snapshot()
+
+    async def query_events(self, http, calendar_id, start, end):
+        """Read a bounded interval for explicit transcript action target matching."""
+        def instant(value):
+            result=value if isinstance(value,datetime) else datetime.fromisoformat(str(value).replace('Z','+00:00'))
+            if result.tzinfo is None:raise ValueError('Event lookup needs timezone-aware dates.')
+            return result
+        begin,finish=instant(start),instant(end)
+        if not 0<finish.timestamp()-begin.timestamp()<=32*86400:raise ValueError('Choose an event lookup window of at most 32 days.')
+        async with self.lock:
+            generation=self.generation
+            calendar=next((c for c in self.cache.get('calendars',[]) if c.get('id')==calendar_id),None)
+            if not calendar:raise ValueError('Choose a connected calendar.')
+            calendar={**calendar,'writable':self.has_write_scope() and calendar.get('access_role') in ('owner','writer')}
+            token=await self._access_token(http)
+            events=[];page=None
+            for _ in range(5):
+                params=dict(timeMin=begin.isoformat(),timeMax=finish.isoformat(),singleEvents='true',orderBy='startTime',showDeleted='false',maxResults='100')
+                if page:params['pageToken']=page
+                result=await self._get(http,token,'/calendars/'+quote(calendar_id,safe='')+'/events',params)
+                for event in result.get('items',[]):
+                    normalized=normalize_event(event,calendar)
+                    if normalized:events.append(normalized)
+                page=result.get('nextPageToken')
+                if not page:break
+            if page:raise ValueError('Too many calendar events to choose a target safely.')
+            if generation!=self.generation:raise CalendarAccessError('Calendar connection changed.')
+            return events
+
+    def _writable_calendar(self, identity):
+        if not self.has_write_scope():
+            raise CalendarAccessError('Reconnect Google Calendar and allow event editing to make changes.')
+        if not isinstance(identity,str) or not identity or len(identity)>1000:
+            raise ValueError('Choose a connected calendar.')
+        calendar=next((c for c in self.cache.get('calendars',[]) if c.get('id')==identity),None)
+        if not calendar or calendar.get('access_role') not in ('owner','writer'):
+            raise CalendarAccessError('Choose a calendar you have permission to edit.')
+        return {**calendar,'writable':True}
+
+    async def _write_event(self, http, method, calendar_id, fields=None, event_id=None):
+        body=event_fields(fields) if method!='DELETE' else None
+        if method in ('PATCH','DELETE') and (not isinstance(event_id,str) or not event_id or len(event_id)>500):
+            raise ValueError('Choose a valid calendar event.')
+        if method=='PATCH':
+            for key in ('start','end'):
+                body[key]['dateTime' if fields['all_day'] else 'date']=None
+                if fields['all_day']:body[key]['timeZone']=None
+        async with self.lock:
+            generation=self.generation
+            calendar=self._writable_calendar(calendar_id)
+            token=await self._access_token(http)
+            # A refresh can change the granted scopes; check again before sending a write.
+            self._writable_calendar(calendar_id)
+            path='/calendars/'+quote(calendar_id,safe='')+'/events'
+            if event_id is not None:path+='/'+quote(event_id,safe='')
+            headers={'Authorization':'Bearer '+token}
+            cached=next((e for e in self.cache.get('events',[]) if e.get('calendar_id')==calendar_id and e.get('id')==event_id),None)
+            etag=(cached or {}).get('etag')
+            if isinstance(etag,str) and len(etag)<2000 and not any(c in etag for c in ('\r','\n')):headers['If-Match']=etag
+            options=dict(headers=headers,params={'sendUpdates':'none'},timeout=aiohttp.ClientTimeout(total=15))
+            if body is not None:options['json']=body
+            try:
+                async with http.request(method,API_URL+path,**options) as response:
+                    if response.status==401:
+                        self.tokens['expires_at']=0
+                        raise CalendarAccessError('Calendar sign-in needs to be renewed before editing.')
+                    if response.status==403:raise CalendarAccessError('Google Calendar did not allow this edit. Reconnect or check calendar permissions.')
+                    if response.status==412:raise ValueError('This event changed elsewhere. Refresh the agenda before editing it again.')
+                    if response.status in (404,410):raise ValueError('This event or calendar no longer exists. Refresh the agenda.')
+                    if response.status not in ((204,) if method=='DELETE' else (200,201)):
+                        raise OSError('Calendar could not confirm this change. Check Google Calendar before retrying.')
+                    result=None if method=='DELETE' else await response.json()
+            except (aiohttp.ClientError,TimeoutError):
+                raise OSError('Calendar could not confirm this change. Check Google Calendar before retrying.') from None
+            if generation!=self.generation:
+                raise CalendarAccessError('The calendar connection changed. Check Google Calendar before retrying the edit.')
+            normalized=None if method=='DELETE' else normalize_event(result,calendar)
+            if method!='DELETE' and normalized is None:
+                raise ValueError('Calendar changed, but its response could not be read. Refresh before retrying.')
+            # Apply the confirmed result locally before refreshing, so stale cache cannot undo it.
+            self.cache['events']=[e for e in self.cache.get('events',[]) if not (e.get('calendar_id')==calendar_id and e.get('id')==event_id)]
+            if normalized:
+                tz=zone(self.cache.get('timezone',calendar.get('timezone')))
+                selected_day=self.selected_date(str(tz))
+                begin=datetime.combine(selected_day,day_time(),tz).timestamp()
+                finish=datetime.combine(selected_day+timedelta(days=1),day_time(),tz).timestamp()
+                if normalized['start']<finish and normalized['end']>begin:self.cache['events'].append(normalized)
+            private_json(self.cache_path,self.cache)
+        await self.refresh(http)
+        return normalized
+
+    async def create_event(self, http, calendar_id, fields):
+        return await self._write_event(http,'POST',calendar_id,fields=fields)
+
+    async def update_event(self, http, calendar_id, event_id, fields):
+        return await self._write_event(http,'PATCH',calendar_id,fields=fields,event_id=event_id)
+
+    async def delete_event(self, http, calendar_id, event_id):
+        await self._write_event(http,'DELETE',calendar_id,event_id=event_id)
+        return {'deleted':True,'id':event_id,'calendar_id':calendar_id}
 
     def select(self, identities):
         available = {c['id'] for c in self.cache.get('calendars', [])}

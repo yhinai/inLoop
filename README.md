@@ -44,8 +44,8 @@ The phone supplies **GPS and Health**, separately from wearable audio. It is not
 ## What you see
 
 - **Live transcript:** newest speech at the top, interim words as they arrive, and saved final captions with speaker labels.
-- **To-do:** review suggestions, add your own tasks, and jump back to the supporting speech. Calendar suggestions do not create calendar events automatically.
-- **Today:** see current and upcoming Google Calendar events in a read-only agenda, with calendar selection and sync status.
+- **To-do:** review suggestions, add your own tasks, and jump back to the supporting speech. Gemini Decision can complete matching tasks and apply clear calendar requests automatically once Google event-edit access is enabled.
+- **Today:** see today’s Google Calendar agenda; add, edit and delete events, or use the editor when a spoken request needs more details.
 - **Location:** select a passage to see a phone GPS fix matched to its recording time, when available.
 - **GitHub:** browse your open issues and pull requests.
 - **Devices and Health:** connection status, IP addresses, and phone readings with their measurement times.
@@ -84,7 +84,7 @@ Sessions, transcripts, suggestions, and GPS snapshots are stored under the ignor
 | Guide | What it covers |
 | --- | --- |
 | [App guide](docs/INLOOP.md) | Controls, models, storage, Maps, and data sources |
-| [Today calendar](docs/CALENDAR.md) | Google sign-in, calendar selection, and read-only agenda sync |
+| [Today calendar](docs/CALENDAR.md) | Google sign-in, agenda sync, and event editing |
 | [Vexo setup](docs/VEXO.md) | Bluetooth, USB alternative, and device checks |
 | [Phone connection](scripts/inloop-phone-snapshot.md) | GPS and Health over ADB |
 | [Wireless phone telemetry](docs/PHONE_TAILSCALE.md) | Direct phone-to-Mac GPS and Health over Tailscale |

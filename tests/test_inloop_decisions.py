@@ -112,6 +112,34 @@ class DecisionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([r['source_id'] for r in spans],['0','1'])
         self.assertEqual(tasks[0]['quote'],'I need to submit')
 
+    async def test_explicit_completion_matches_existing_task_with_audit(self):
+        task=self.app.store.add_task('Test the Bluetooth connection.')
+        ids=self.events(['I finished testing the Bluetooth connection.'])
+        complete=dict(type='choice',choice='task_0',confidence=.96,probabilities=dict(none=.04,task_0=.96))
+        self.app.http=FakeHTTP({'answers':{'candidate_0':answer('none'),'completion_0':complete}})
+        self.assertEqual(await self.app.extract(ids),[])
+        self.assertEqual(self.app.store.tasks()[0]['status'],'done')
+        row=self.app.store.db.execute('SELECT * FROM task_actions').fetchone()
+        self.assertEqual((row['task_id'],row['source_id'],row['operation']),(task['id'],'0','complete'))
+
+    async def test_negated_or_uncertain_completion_does_not_change_task(self):
+        self.app.store.add_task('Test the Bluetooth connection.')
+        ids=self.events(['I have not finished testing Bluetooth.'])
+        for confidence in (.2,.89):
+            choice='task_0' if confidence>.5 else 'none'
+            decision=dict(type='choice',choice=choice,confidence=max(confidence,1-confidence),probabilities=dict(task_0=confidence,none=1-confidence))
+            self.app.http=FakeHTTP({'answers':{'candidate_0':answer('none'),'completion_0':decision}})
+            await self.app.extract(ids)
+            self.assertEqual(self.app.store.tasks()[0]['status'],'open')
+            self.assertEqual(self.app.store.db.execute('SELECT count(*) FROM task_actions').fetchone()[0],0)
+
+    async def test_invalid_completion_prevents_all_batch_changes(self):
+        self.app.store.add_task('Test the Bluetooth connection.')
+        ids=self.events(['I finished testing Bluetooth.'])
+        self.app.http=FakeHTTP({'answers':{'candidate_0':answer('none'),'completion_0':dict(type='choice',choice='invented',confidence=1,probabilities={'invented':1})}})
+        with self.assertRaises(ValueError):await self.app.extract(ids)
+        self.assertEqual(self.app.store.tasks()[0]['status'],'open')
+
     async def test_existing_exact_task_is_not_resubmitted(self):
         ids=self.events(['Please test Bluetooth.'])
         self.app.store.add_task('Please test Bluetooth.')
@@ -139,6 +167,28 @@ class DecisionValidationTests(unittest.TestCase):
                        event('b','a paper tomorrow at 5PM.',said=1040)]:
             candidates=task_candidates([first,second],[])
             self.assertFalse(any('source_spans' in candidate for candidate in candidates))
+
+    def test_multispeaker_event_continues_only_its_last_speaker(self):
+        first=dict(id='a',text='Can you show an example? Yes. I need to submit',said_at=1000,session_id='one',
+                   event=dict(speaker_turns=[dict(speaker_key='stream:1',text='Can you show an example?'),
+                                             dict(speaker_key='stream:0',text='Yes. I need to submit')]))
+        second=dict(id='b',text='a paper this Wednesday at 5PM.',said_at=1004,session_id='one',
+                    event=dict(speaker_turns=[dict(speaker_key='stream:0',text='a paper this Wednesday at 5PM.')]))
+        candidates=task_candidates([first,second],[])
+        self.assertIn('I need to submit a paper this Wednesday at 5PM.',[c['text'] for c in candidates])
+
+    def test_pickup_continuation_keeps_uncertain_date_tail(self):
+        first=dict(id='a',text='I need to pick up my',said_at=1000,session_id='one',
+                   event=dict(speaker_turns=[dict(speaker_key='stream:0',text='I need to pick up my')]))
+        second=dict(id='b',text='grandma from the airport on Saturday.',said_at=1003,session_id='one',
+                    event=dict(speaker_turns=[dict(speaker_key='stream:0',text='grandma from the airport'),
+                        dict(speaker_key='stream:1',text='on Saturday.',voice_identity={'status':'uncertain'})]))
+        candidates=task_candidates([first,second],[])
+        self.assertEqual(candidates[0]['text'],'I need to pick up my grandma from the airport on Saturday.')
+        self.assertEqual(len(candidates[0]['source_spans']),2)
+        second['event']['speaker_turns'][1]['text']='I am going shopping.'
+        second['text']='grandma from the airport I am going shopping.'
+        self.assertFalse(any('source_spans' in c for c in task_candidates([first,second],[])))
 
     def test_rejects_invalid_choice_confidence_or_probability_distribution(self):
         for changed in [{'choice':'book_calendar_now'},{'confidence':True},{'confidence':2},{'probabilities':{'todo':1}}, {'probabilities':dict(todo=.8,none=.8,calendar=.2,action_item=.2)}]:
