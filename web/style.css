@@ -296,6 +296,11 @@ body.dark .header-tools .icon-button { background:#1d1f1b; }
 .today-section { display:flex; flex-direction:column; min-height:0; min-width:0; }
 .today-section .section-heading { gap:9px; align-items:baseline; }
 #today-date { margin-left:0; font-size:11px; white-space:nowrap; }
+.day-nav { display:inline-flex; gap:2px; align-self:center; }
+.today-section .section-heading .day-nav button { margin-left:0; width:22px; height:22px; border-radius:6px; font-size:16px; line-height:1; color:var(--muted); }
+.today-section .section-heading .day-nav button:hover:not(:disabled) { color:var(--teal); background:var(--line); }
+.today-section .section-heading .day-nav button:disabled { opacity:.35; cursor:default; }
+.today-section .section-heading #agenda-today { margin-left:0; font-size:10px; }
 #calendar-settings { margin-left:auto; font-size:10px; }
 .agenda-surface { display:flex; flex-direction:column; flex:1; min-height:0; padding:0 13px; overflow:hidden; }
 #agenda { flex:1; min-height:0; overflow-y:auto; scrollbar-width:thin; overscroll-behavior:contain; }

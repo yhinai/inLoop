@@ -4,7 +4,7 @@ const node=(tag,cls,text)=>{const n=document.createElement(tag);if(cls)n.classNa
 const calendarIcon=()=>{const n=document.createElementNS('http://www.w3.org/2000/svg','svg');for(const[k,v]of Object.entries({viewBox:'0 0 24 24',width:20,height:20,fill:'none',stroke:'currentColor','stroke-width':1.3,'aria-hidden':'true'}))n.setAttribute(k,v);const p=document.createElementNS(n.namespaceURI,'path');p.setAttribute('d','M5 5h14a1 1 0 0 1 1 1v14H4V6a1 1 0 0 1 1-1ZM8 2v6m8-6v6M4 10h16');n.append(p);return n;};
 const safeLink=(value,fallback)=>{try{const u=new URL(value);return u.protocol==='https:'&&['calendar.google.com','www.google.com'].includes(u.hostname)?u.href:fallback;}catch{return fallback;}};
 export function createAgenda(api,notify,{preview=false}={}){
- let calendar={},signature='',busy=false,awaitingSave=false;
+ let calendar={},signature='',busy=false,awaitingSave=false,offset=0;
  const dialog=$('#calendar-dialog');
  function message(text){$('#calendar-message').textContent=text;$('#calendar-message').hidden=!text;}
  async function signIn(){
@@ -27,34 +27,49 @@ export function createAgenda(api,notify,{preview=false}={}){
  function render(){
   const tz=calendar.timezone||Intl.DateTimeFormat().resolvedOptions().timeZone;
   const now=Date.now()/1000;
-  const date=new Intl.DateTimeFormat(undefined,{weekday:'short',month:'short',day:'numeric',timeZone:tz}).format(new Date());
+  // Calendar-timezone day keys (YYYY-MM-DD); day arithmetic happens at UTC noon to avoid DST edges.
+  const dayKey=ms=>new Intl.DateTimeFormat('en-CA',{year:'numeric',month:'2-digit',day:'2-digit',timeZone:tz}).format(new Date(ms));
+  const noon=iso=>new Date(iso+'T12:00:00Z');
+  const shift=(iso,n)=>{const d=noon(iso);d.setUTCDate(d.getUTCDate()+n);return d.toISOString().slice(0,10);};
+  const between=(a,b)=>Math.round((noon(b)-noon(a))/864e5);
+  const today=/^\d{4}-\d{2}-\d{2}$/.test(calendar.date||'')?calendar.date:dayKey(Date.now());
+  const first=/^\d{4}-\d{2}-\d{2}$/.test(calendar.range_start||'')?between(today,calendar.range_start):-7;
+  const last=/^\d{4}-\d{2}-\d{2}$/.test(calendar.range_end||'')?between(today,calendar.range_end):14;
+  offset=Math.min(last,Math.max(first,offset));
+  const day=shift(today,offset),isToday=offset===0;
+  const date=new Intl.DateTimeFormat(undefined,{weekday:'short',month:'short',day:'numeric',timeZone:'UTC'}).format(noon(day));
+  $('#agenda-day').textContent=isToday?'Today':offset===-1?'Yesterday':offset===1?'Tomorrow':new Intl.DateTimeFormat(undefined,{weekday:'long',timeZone:'UTC'}).format(noon(day));
   $('#today-date').textContent=date;
-  $('#today-date').title='Today · '+tz;
+  $('#today-date').title=(isToday?'Today':'Selected day')+' · '+tz;
+  $('#agenda-prev').disabled=offset<=first;$('#agenda-next').disabled=offset>=last;$('#agenda-today').hidden=isToday;
+  $('#agenda').setAttribute('aria-label',(isToday?'Today':date)+' calendar events');
   const time=v=>new Intl.DateTimeFormat(undefined,{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:tz}).format(new Date(v*1000));
-  const all=(calendar.events||[]).filter(e=>Number.isFinite(e.start)&&Number.isFinite(e.end)&&e.end>now);
+  // An event belongs to every calendar day it overlaps; ends are exclusive, so step back one second.
+  const onDay=e=>dayKey(e.start*1000)<=day&&day<=dayKey(Math.max(e.start,e.end-1)*1000);
+  const all=(calendar.events||[]).filter(e=>Number.isFinite(e.start)&&Number.isFinite(e.end)&&onDay(e)&&(!isToday||e.end>now));
   all.sort((a,b)=>Number(b.all_day)-Number(a.all_day)||a.start-b.start);
-  const key=JSON.stringify([calendar,date,Math.floor(now/30)]);
+  const key=JSON.stringify([calendar,day,Math.floor(now/30)]);
   if(key===signature)return;signature=key;
   const connected=calendar.authorized||calendar.status==='connected';
   const cached=calendar.status==='unavailable'||calendar.status==='authorization_required';
   $('#calendar-settings').textContent=connected?'Calendars ↗':'Connect ↗';
-  $('#open-calendar').href=safeLink(calendar.open_url,'https://calendar.google.com/');
+  $('#open-calendar').href=safeLink('https://calendar.google.com/calendar/u/0/r/day/'+day.replaceAll('-','/'),'https://calendar.google.com/');
   $('#open-calendar').hidden=!connected;
   const list=$('#agenda');list.replaceChildren();
   if(!connected){
    const box=node('div','agenda-empty');box.append(calendarIcon(),node('p','agenda-empty-title','Your day, in one place.'),node('p','caption','Connect Google Calendar to see what’s next.'));
    const button=node('button','calendar-connect-button','Connect Google Calendar');button.onclick=openSettings;box.append(button);list.append(box);
   }else if(!all.length){
-   const box=node('div','agenda-empty');box.append(calendarIcon(),node('p','agenda-empty-title',cached?'Calendar needs a refresh':!(calendar.selected||[]).length?'No calendars selected':'No more events today'),node('p','caption',cached?'Showing the last available calendar sync.':!(calendar.selected||[]).length?'Choose calendars to show in Today.':'A little room to focus.'));list.append(box);
+   const box=node('div','agenda-empty');box.append(calendarIcon(),node('p','agenda-empty-title',cached?'Calendar needs a refresh':!(calendar.selected||[]).length?'No calendars selected':isToday?'No more events today':'Nothing scheduled'),node('p','caption',cached?'Showing the last available calendar sync.':!(calendar.selected||[]).length?'Choose calendars to show in Today.':isToday?'A little room to focus.':'No events on '+date+'.'));list.append(box);
   }else{
    let nextMarked=false;
    for(const e of all){
     const link=node('a','agenda-event');link.href=safeLink(e.html_url,'https://calendar.google.com/');link.target='_blank';link.rel='noopener noreferrer';link.append(calendarIcon());
     const range=node('div','agenda-time',e.all_day?'All day':time(e.start)+' – '+time(e.end));
     const body=node('div','agenda-event-body');body.append(node('p','agenda-event-title',e.title));
-    let note=e.calendar_name||'Google Calendar',current=!e.all_day&&e.start<=now;
+    let note=e.calendar_name||'Google Calendar',current=isToday&&!e.all_day&&e.start<=now;
     if(current){note='Now · ends '+time(e.end);link.classList.add('current');}
-    else if(!e.all_day&&!nextMarked){const min=Math.max(1,Math.ceil((e.start-now)/60));note=min<60?'Next · '+min+' min':'Next · '+time(e.start);nextMarked=true;link.classList.add('next');}
+    else if(isToday&&!e.all_day&&!nextMarked){const min=Math.max(1,Math.ceil((e.start-now)/60));note=min<60?'Next · '+min+' min':'Next · '+time(e.start);nextMarked=true;link.classList.add('next');}
     body.append(node('p','agenda-event-note',note));link.append(range,body);link.title=e.title+' · '+(e.calendar_name||'Calendar');list.append(link);
    }
   }
@@ -86,6 +101,15 @@ export function createAgenda(api,notify,{preview=false}={}){
  };
  $('#calendar-refresh').onclick=async()=>{if(preview)return;try{await api('calendar/refresh','POST',{});message('Refreshing your calendar…');}catch(e){message(e.message);}};
  $('#calendar-disconnect').onclick=async()=>{if(preview){dialog.close();return;}try{await api('calendar/disconnect','POST',{});dialog.close();}catch(e){message(e.message);}};
+ function go(step){offset=step===0?0:offset+step;signature='';render();}
+ $('#agenda-prev').onclick=()=>go(-1);
+ $('#agenda-next').onclick=()=>go(1);
+ $('#agenda-today').onclick=()=>go(0);
+ document.addEventListener('keydown',e=>{
+  if(e.defaultPrevented||e.altKey||e.ctrlKey||e.metaKey||e.shiftKey||(e.key!=='ArrowLeft'&&e.key!=='ArrowRight'))return;
+  if(document.querySelector('dialog[open]')||e.target.closest?.('input,textarea,select,[contenteditable="true"]'))return;
+  e.preventDefault();go(e.key==='ArrowLeft'?-1:1);
+ });
  setInterval(render,30000);
  return {update,openSettings};
 }

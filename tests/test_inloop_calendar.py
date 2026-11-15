@@ -1,6 +1,6 @@
 """Calendar read-only authorization, date boundaries, and privacy boundaries."""
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 from pathlib import Path
 import stat
@@ -11,7 +11,7 @@ from unittest import mock
 from urllib.parse import parse_qs,urlparse
 
 from aiohttp.test_utils import TestClient,TestServer
-from inloop_calendar import CalendarAgenda,normalize_event,zone,SCOPES
+from inloop_calendar import CalendarAgenda,normalize_event,zone,SCOPES,PAST_DAYS,FUTURE_DAYS
 from inloop_app import InLoop,application
 
 CLIENT={'installed':{'client_id':'test.apps.googleusercontent.com','client_secret':'test-only'}}
@@ -87,6 +87,25 @@ class CalendarTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.agenda.status,'unavailable');self.assertEqual(len(self.agenda.snapshot()['events']),1)
         self.agenda.cache['date']='2000-01-01';self.assertEqual(self.agenda.snapshot()['events'],[])
         self.agenda.disconnect();self.assertEqual(self.agenda.snapshot()['events'],[]);self.assertFalse(self.agenda.cache_path.exists())
+
+    async def test_sync_fetches_a_browsable_window_around_today(self):
+        self.agenda.configure(CLIENT);self.agenda.tokens={'refresh_token':'test'}
+        tz=zone('America/Los_Angeles');today=datetime.now(tz).date()
+        calls=[]
+        async def get(http,token,path,params):
+            calls.append((path,params))
+            if path.endswith('calendarList'):return {'items':[{'id':'main@example.com','primary':True,'summary':'Main','timeZone':'America/Los_Angeles'}]}
+            later=(today+timedelta(days=3)).isoformat()
+            return {'items':[dict(id='later',summary='Later',start={'dateTime':later+'T09:00:00-08:00'},end={'dateTime':later+'T10:00:00-08:00'})]}
+        with mock.patch.object(self.agenda,'_access_token',new=mock.AsyncMock(return_value='test')),mock.patch.object(self.agenda,'_get',side_effect=get):
+            await self.agenda.refresh(None)
+        params=calls[1][1]
+        self.assertEqual(datetime.fromisoformat(params['timeMin']).date(),today-timedelta(days=PAST_DAYS))
+        self.assertEqual(datetime.fromisoformat(params['timeMax']).date(),today+timedelta(days=FUTURE_DAYS+1))
+        value=self.agenda.snapshot()
+        self.assertEqual([e['id'] for e in value['events']],['later'])
+        self.assertEqual(value['range_start'],(today-timedelta(days=PAST_DAYS)).isoformat())
+        self.assertEqual(value['range_end'],(today+timedelta(days=FUTURE_DAYS)).isoformat())
 
 class CalendarApiTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

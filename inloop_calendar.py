@@ -19,6 +19,9 @@ TOKEN_URL = 'https://oauth2.googleapis.com/token'
 API_URL = 'https://www.googleapis.com/calendar/v3'
 SCOPES = ('https://www.googleapis.com/auth/calendar.events.readonly',
           'https://www.googleapis.com/auth/calendar.calendarlist.readonly')
+# Days around today fetched in each sync, so the agenda can step between days.
+PAST_DAYS = 7
+FUTURE_DAYS = 14
 
 
 class CalendarAccessError(Exception):
@@ -124,7 +127,8 @@ class CalendarAgenda:
 
     def snapshot(self):
         tz_name = self.cache.get('timezone', 'America/Los_Angeles')
-        today = datetime.now(zone(tz_name)).date().isoformat()
+        current = datetime.now(zone(tz_name)).date()
+        today = current.isoformat()
         valid_day = self.cache.get('date') == today
         selected = self.preferences.get('selected')
         events = [e for e in self.cache.get('events', []) if selected is None or e.get('calendar_id') in selected]
@@ -132,6 +136,8 @@ class CalendarAgenda:
                     events=events if valid_day else [],
                     calendars=self.cache.get('calendars', []),
                     selected=self.preferences.get('selected', []), timezone=tz_name, date=today,
+                    range_start=(current-timedelta(days=PAST_DAYS)).isoformat(),
+                    range_end=(current+timedelta(days=FUTURE_DAYS)).isoformat(),
                     checked_at=self.cache.get('checked_at'),
                     open_url='https://calendar.google.com/calendar/u/0/r/day/' + today.replace('-', '/'))
 
@@ -240,8 +246,8 @@ class CalendarAgenda:
                 tz_name = next((c['timezone'] for c in calendars if c['primary']), 'America/Los_Angeles')
                 tz = zone(tz_name)
                 today = datetime.now(tz).date()
-                start = datetime.combine(today, day_time(), tz)
-                finish = datetime.combine(today+timedelta(days=1), day_time(), tz)
+                start = datetime.combine(today-timedelta(days=PAST_DAYS), day_time(), tz)
+                finish = datetime.combine(today+timedelta(days=FUTURE_DAYS+1), day_time(), tz)
                 async def events_for(calendar):
                     events, page = [], None
                     for _ in range(5):
